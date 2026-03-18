@@ -3,9 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Modern Camera Control Panel</title>
+<title>Modern Camera Control with Auto-Center</title>
 <style>
-/* ====== Body & Fonts ====== */
 body {
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     background: linear-gradient(135deg,#1f1f1f,#3c3c3c);
@@ -15,8 +14,6 @@ body {
     align-items: center;
     padding: 20px;
 }
-
-/* ====== Container ====== */
 #camera-container {
     position: relative;
     width: 700px;
@@ -27,8 +24,6 @@ body {
     margin-bottom: 20px;
     background: black;
 }
-
-/* ====== Video ====== */
 #video {
     position: absolute;
     top: 0;
@@ -41,8 +36,12 @@ body {
     object-fit: cover;
     transition: transform 0.1s ease-out;
 }
-
-/* ====== Controls Panel ====== */
+#overlay {
+    position: absolute;
+    border: 2px solid #00ff00;
+    pointer-events: none;
+    z-index: 10;
+}
 #controls {
     display: flex;
     flex-direction: column;
@@ -52,12 +51,9 @@ body {
     border-radius: 16px;
     box-shadow: 0 4px 15px rgba(0,0,0,0.5);
 }
-
-/* ====== Sliders ====== */
 .control-group {
     margin-bottom: 12px;
 }
-
 .control-group label {
     display: flex;
     justify-content: space-between;
@@ -65,7 +61,6 @@ body {
     font-size: 14px;
     font-weight: 500;
 }
-
 input[type="range"] {
     -webkit-appearance: none;
     width: 100%;
@@ -74,10 +69,8 @@ input[type="range"] {
     border-radius: 3px;
     outline: none;
 }
-
 input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none;
-    appearance: none;
     width: 18px;
     height: 18px;
     background: #ff4081;
@@ -86,12 +79,9 @@ input[type="range"]::-webkit-slider-thumb {
     border: 2px solid #fff;
     transition: transform 0.1s;
 }
-
 input[type="range"]::-webkit-slider-thumb:hover {
     transform: scale(1.2);
 }
-
-/* ====== Button ====== */
 button {
     padding: 12px 20px;
     font-size: 16px;
@@ -103,19 +93,10 @@ button {
     cursor: pointer;
     transition: all 0.2s ease;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    margin-top: 8px;
 }
-
-button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 16px rgba(0,0,0,0.6);
-}
-
-button:active {
-    transform: translateY(0px);
-    box-shadow: 0 3px 8px rgba(0,0,0,0.5);
-}
-
-/* ====== Titles ====== */
+button:hover {transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.6);}
+button:active {transform: translateY(0px); box-shadow: 0 3px 8px rgba(0,0,0,0.5);}
 h2 {
     margin-bottom: 20px;
     font-weight: 600;
@@ -127,10 +108,11 @@ h2 {
 </head>
 <body>
 
-<h2>🎥 Modern Camera Panel</h2>
+<h2>🎥 Camera Control with Auto-Center</h2>
 
 <div id="camera-container">
     <video id="video" autoplay playsinline></video>
+    <div id="overlay"></div>
 </div>
 
 <div id="controls">
@@ -151,26 +133,22 @@ h2 {
         <input type="range" id="focusSlider" min="0" max="100" step="1" value="0">
     </div>
     <button id="startBtn">Start Camera</button>
+    <button id="toggleAutoCenterBtn">Auto-Center: ON</button>
 </div>
 
 <script>
-// ===== Camera Controller =====
 const CameraController = (() => {
-    let videoTrack = null;
-    let capabilities = {};
-    let settings = {};
-    let video = null;
-
-    let offsetX = 0, offsetY = 0;
-    let isDragging = false;
-    let dragStart = {x: 0, y: 0};
-
-    let faceDetector = null;
-    let autoCenterEnabled = false;
+    let videoTrack=null, capabilities={}, settings={}, video=null;
+    let offsetX=0, offsetY=0, isDragging=false, dragStart={x:0,y:0};
+    let faceDetector=null;
+    let autoCenterEnabled=false;
+    let overlay=null;
 
     async function start(videoElementId="video") {
         try {
             video = document.getElementById(videoElementId);
+            overlay = document.getElementById("overlay");
+
             const stream = await navigator.mediaDevices.getUserMedia({video:{width:700,height:500}, audio:false});
             video.srcObject = stream;
 
@@ -183,69 +161,87 @@ const CameraController = (() => {
             setupUI();
             setupDragTouch();
 
-            if('FaceDetector' in window) {
+            if('FaceDetector' in window){
                 faceDetector = new FaceDetector({fastMode:true});
                 autoCenterEnabled = true;
                 requestAnimationFrame(detectFaceLoop);
-            } else {
-                console.warn("FaceDetector API not supported.");
-            }
-        } catch(err) {
+            } else { console.warn("FaceDetector API not supported."); }
+
+        } catch(err){
             console.error("Camera start error:", err);
             alert("Failed to start camera. Check HTTPS or permissions.");
         }
     }
 
-    async function applyConstraint(name, value) {
+    async function applyConstraint(name,value){
         if(!videoTrack) return;
-        try {
-            await videoTrack.applyConstraints({advanced:[{[name]:value}]});
-        } catch(e) { console.warn(`Constraint ${name} not supported:`, e); }
+        try{ await videoTrack.applyConstraints({advanced:[{[name]:value}]}); }
+        catch(e){ console.warn(`Constraint ${name} not supported:`, e);}
     }
 
-    function updateTransform(zoom=1) {
+    function clampOffset(zoom){
+        const containerWidth=video.offsetWidth;
+        const containerHeight=video.offsetHeight;
+        const zoomWidth = containerWidth * zoom;
+        const zoomHeight = containerHeight * zoom;
+        const maxOffsetX = (zoomWidth - containerWidth)/2;
+        const maxOffsetY = (zoomHeight - containerHeight)/2;
+        if(offsetX>maxOffsetX) offsetX=maxOffsetX;
+        if(offsetX<-maxOffsetX) offsetX=-maxOffsetX;
+        if(offsetY>maxOffsetY) offsetY=maxOffsetY;
+        if(offsetY<-maxOffsetY) offsetY=-maxOffsetY;
+    }
+
+    function updateTransform(zoom=1){
+        clampOffset(zoom);
         video.style.transform = `scale(${zoom}) translate(${offsetX}px, ${offsetY}px)`;
     }
 
-    function setupUI() {
-        const zoomSlider = document.getElementById("zoomSlider");
-        const brightnessSlider = document.getElementById("brightnessSlider");
-        const contrastSlider = document.getElementById("contrastSlider");
-        const focusSlider = document.getElementById("focusSlider");
+    function setupUI(){
+        const zoomSlider=document.getElementById("zoomSlider");
+        const brightnessSlider=document.getElementById("brightnessSlider");
+        const contrastSlider=document.getElementById("contrastSlider");
+        const focusSlider=document.getElementById("focusSlider");
 
-        const zoomValue = document.getElementById("zoomValue");
-        const brightnessValue = document.getElementById("brightnessValue");
-        const contrastValue = document.getElementById("contrastValue");
-        const focusValue = document.getElementById("focusValue");
+        const zoomValue=document.getElementById("zoomValue");
+        const brightnessValue=document.getElementById("brightnessValue");
+        const contrastValue=document.getElementById("contrastValue");
+        const focusValue=document.getElementById("focusValue");
 
         zoomSlider?.addEventListener("input", e=>{
             const val=parseFloat(e.target.value);
             zoomValue.innerText=val.toFixed(2)+"x";
-            if(capabilities.zoom) applyConstraint("zoom", val);
+            if(capabilities.zoom) applyConstraint("zoom",val);
             updateTransform(val);
         });
 
         brightnessSlider?.addEventListener("input", e=>{
             const val=parseFloat(e.target.value);
             brightnessValue.innerText=val.toFixed(2);
-            if(capabilities.brightness) applyConstraint("brightness", val);
+            if(capabilities.brightness) applyConstraint("brightness",val);
         });
 
         contrastSlider?.addEventListener("input", e=>{
             const val=parseFloat(e.target.value);
             contrastValue.innerText=val.toFixed(2);
-            if(capabilities.contrast) applyConstraint("contrast", val);
+            if(capabilities.contrast) applyConstraint("contrast",val);
         });
 
         focusSlider?.addEventListener("input", e=>{
             const val=parseFloat(e.target.value);
             focusValue.innerText=val;
-            if(capabilities.focusDistance) applyConstraint("focusDistance", val);
+            if(capabilities.focusDistance) applyConstraint("focusDistance",val);
+        });
+
+        // Toggle Auto-Center button
+        const toggleBtn=document.getElementById("toggleAutoCenterBtn");
+        toggleBtn.addEventListener("click", ()=>{
+            autoCenterEnabled = !autoCenterEnabled;
+            toggleBtn.innerText = `Auto-Center: ${autoCenterEnabled?"ON":"OFF"}`;
         });
     }
 
-    function setupDragTouch() {
-        // Mouse
+    function setupDragTouch(){
         video.addEventListener("mousedown", e=>{
             isDragging=true;
             dragStart.x=e.clientX-offsetX;
@@ -278,19 +274,26 @@ const CameraController = (() => {
         window.addEventListener("touchend", ()=>{isDragging=false;});
     }
 
-    async function detectFaceLoop() {
-        if(!autoCenterEnabled||!faceDetector) return;
-        try {
+    async function detectFaceLoop(){
+        if(!faceDetector) return;
+        try{
             const faces = await faceDetector.detect(video);
             if(faces.length>0){
                 const face = faces[0].boundingBox;
-                const centerX=(face.x+face.width/2)-video.offsetWidth/2;
-                const centerY=(face.y+face.height/2)-video.offsetHeight/2;
-                offsetX -= centerX*0.05;
-                offsetY -= centerY*0.05;
-                updateTransform(parseFloat(document.getElementById("zoomSlider")?.value||1));
-            }
-        } catch(e){console.warn("Face detection error:", e);}
+                overlay.style.left = face.x + "px";
+                overlay.style.top = face.y + "px";
+                overlay.style.width = face.width + "px";
+                overlay.style.height = face.height + "px";
+
+                if(autoCenterEnabled){
+                    const centerX = (face.x + face.width/2) - video.offsetWidth/2;
+                    const centerY = (face.y + face.height/2) - video.offsetHeight/2;
+                    offsetX -= centerX*0.05;
+                    offsetY -= centerY*0.05;
+                    updateTransform(parseFloat(document.getElementById("zoomSlider")?.value||1));
+                }
+            } else { overlay.style.width="0px"; }
+        } catch(e){ console.warn("Face detection error:", e);}
         requestAnimationFrame(detectFaceLoop);
     }
 

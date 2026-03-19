@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Pro Camera Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 
 <style>
 :root {
@@ -259,6 +260,26 @@ input[type=range]::-webkit-slider-runnable-track { border-radius: 2px; }
   padding: 4px;
   opacity: 0.7;
 }
+
+#face-status {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: 'Space Mono', monospace;
+  font-size: 0.62rem;
+  background: rgba(0,0,0,0.65);
+  border: 1px solid var(--border);
+  padding: 3px 10px;
+  border-radius: 20px;
+  backdrop-filter: blur(8px);
+  color: var(--muted);
+  white-space: nowrap;
+  display: none;
+}
+#face-status.loading { color: var(--accent2); border-color: var(--accent2); }
+#face-status.ready   { color: var(--accent);  border-color: var(--accent); }
+#face-status.error   { color: #ff6b6b;        border-color: #ff6b6b; }
 </style>
 </head>
 <body>
@@ -271,6 +292,7 @@ input[type=range]::-webkit-slider-runnable-track { border-radius: 2px; }
     <div id="face-box"></div>
     <div id="status-badge">● OFFLINE</div>
     <div id="zoom-badge">1.00×</div>
+    <div id="face-status">⏳ Loading face model...</div>
   </div>
   <div id="no-cam">
     <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
@@ -335,6 +357,7 @@ const noCam       = document.getElementById('no-cam');
 const statusBadge = document.getElementById('status-badge');
 const zoomBadge   = document.getElementById('zoom-badge');
 const faceBox     = document.getElementById('face-box');
+const faceStatus  = document.getElementById('face-status');
 
 const sliders = {
   zoom:       { el: document.getElementById('zoom'),       val: document.getElementById('zoomVal') },
@@ -350,21 +373,56 @@ const sliders = {
 // ─── State ──────────────────────────────────────────────
 let track = null;
 let autoCenter = false;
-let faceDetector = null;
+let faceModelReady = false;
 let faceDetecting = false;
 let detectLoop = null;
-
-// Pan offset (in pixels, pre-scale space)
 let panX = 0, panY = 0;
 let dragging = false, dragStartX = 0, dragStartY = 0;
 
-// Defaults
 const DEFAULTS = {
   zoom: 1, brightness: 100, contrast: 100,
   saturation: 100, sharpness: 0, hue: 0, blur: 0, opacity: 100
 };
 
-// ─── Read sliders ────────────────────────────────────────
+// ─── Load face-api.js model (TinyFaceDetector — fast & lightweight) ──
+// Models are loaded from jsDelivr CDN weights
+const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+
+async function loadFaceModel() {
+  faceStatus.style.display = 'block';
+  faceStatus.className = 'loading';
+  faceStatus.textContent = '⏳ Loading face model...';
+  try {
+    // Wait for face-api to be available (loaded via defer)
+    await waitForFaceApi();
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    faceModelReady = true;
+    faceStatus.className = 'ready';
+    faceStatus.textContent = '✓ Face model ready';
+    setTimeout(() => { faceStatus.style.display = 'none'; }, 2500);
+  } catch(e) {
+    faceStatus.className = 'error';
+    faceStatus.textContent = '✗ Face model failed — check network';
+    console.warn('face-api load error:', e);
+  }
+}
+
+function waitForFaceApi(timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      if (typeof faceapi !== 'undefined') return resolve();
+      if (Date.now() - start > timeout) return reject(new Error('face-api timeout'));
+      setTimeout(check, 100);
+    };
+    check();
+  });
+}
+
+// Start loading model immediately on page load
+loadFaceModel();
+
+// ─── Slider helpers ──────────────────────────────────────
 function getValues() {
   return {
     zoom:       +sliders.zoom.el.value,
@@ -378,56 +436,8 @@ function getValues() {
   };
 }
 
-// ─── Apply CSS filter + transform ───────────────────────
-function applyVisuals() {
-  const v = getValues();
-
-  // CSS filter (always works, no hardware dependency)
-  // sharpness = contrast + saturation trick via drop-shadow is weak; use a sharpen approach via SVG filter
-  const sharpen = v.sharpness > 0
-    ? `url(#sharpen-${Math.round(v.sharpness)})`
-    : '';
-
-  video.style.filter = [
-    `brightness(${v.brightness}%)`,
-    `contrast(${v.contrast}%)`,
-    `saturate(${v.saturation}%)`,
-    `hue-rotate(${v.hue}deg)`,
-    `blur(${v.blur}px)`,
-    sharpen,
-  ].filter(Boolean).join(' ');
-
-  video.style.opacity = v.opacity / 100;
-  updateTransform(v.zoom);
-}
-
-// ─── Transform (zoom + pan) ──────────────────────────────
-function updateTransform(zoom) {
-  zoom = zoom ?? +sliders.zoom.el.value;
-  clampPan(zoom);
-  // Apply scale first, then translate — but to avoid the "partial image" bug
-  // we translate BEFORE scale (in CSS the rightmost is applied first):
-  // transform: scale(z) translate(px, py)  — translate is in post-scale space
-  // So we need to divide by zoom to stay in pre-scale space:
-  const tx = panX / zoom;
-  const ty = panY / zoom;
-  video.style.transform = `scale(${zoom}) translate(${tx}px, ${ty}px)`;
-  zoomBadge.textContent = zoom.toFixed(2) + '×';
-}
-
-function clampPan(zoom) {
-  const container = video.parentElement;
-  const w = container.clientWidth;
-  const h = container.clientHeight;
-  const maxX = (w * (zoom - 1)) / 2;
-  const maxY = (h * (zoom - 1)) / 2;
-  panX = Math.max(-maxX, Math.min(maxX, panX));
-  panY = Math.max(-maxY, Math.min(maxY, panY));
-}
-
-// ─── Slider labels ───────────────────────────────────────
 function updateLabels(v) {
-  sliders.zoom.val.textContent       = v.zoom.toFixed(2) + '×';
+  sliders.zoom.val.textContent       = (+v.zoom).toFixed(2) + '×';
   sliders.brightness.val.textContent = v.brightness + '%';
   sliders.contrast.val.textContent   = v.contrast + '%';
   sliders.saturation.val.textContent = v.saturation + '%';
@@ -437,133 +447,137 @@ function updateLabels(v) {
   sliders.opacity.val.textContent    = v.opacity + '%';
 }
 
-// Wire all sliders
 Object.keys(sliders).forEach(key => {
-  sliders[key].el.oninput = () => {
-    updateLabels(getValues());
-    applyVisuals();
-  };
+  sliders[key].el.oninput = () => { updateLabels(getValues()); applyVisuals(); };
 });
 
-// ─── SVG Sharpen Filter (injected once) ──────────────────
-(function injectSharpenFilters() {
+// ─── CSS Filter + Transform ──────────────────────────────
+function applyVisuals() {
+  const v = getValues();
+  const sharpen = v.sharpness > 0 ? `url(#sharpen-${Math.round(v.sharpness)})` : '';
+  video.style.filter = [
+    `brightness(${v.brightness}%)`,
+    `contrast(${v.contrast}%)`,
+    `saturate(${v.saturation}%)`,
+    `hue-rotate(${v.hue}deg)`,
+    `blur(${v.blur}px)`,
+    sharpen,
+  ].filter(Boolean).join(' ');
+  video.style.opacity = v.opacity / 100;
+  updateTransform(v.zoom);
+}
+
+function updateTransform(zoom) {
+  zoom = zoom ?? +sliders.zoom.el.value;
+  clampPan(zoom);
+  const tx = panX / zoom;
+  const ty = panY / zoom;
+  video.style.transform = `scale(${zoom}) translate(${tx}px, ${ty}px)`;
+  zoomBadge.textContent = zoom.toFixed(2) + '×';
+}
+
+function clampPan(zoom) {
+  const c = document.getElementById('camera-container');
+  const maxX = (c.clientWidth  * (zoom - 1)) / 2;
+  const maxY = (c.clientHeight * (zoom - 1)) / 2;
+  panX = Math.max(-maxX, Math.min(maxX, panX));
+  panY = Math.max(-maxY, Math.min(maxY, panY));
+}
+
+// ─── SVG Sharpen Filters ─────────────────────────────────
+(function() {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden';
-  for (let i = 1; i <= 10; i += 0.5) {
-    const idx = Math.round(i);
+  for (let i = 1; i <= 10; i++) {
     const flt = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
-    flt.id = `sharpen-${idx}`;
+    flt.id = `sharpen-${i}`;
     const fe = document.createElementNS('http://www.w3.org/2000/svg', 'feConvolveMatrix');
-    const s = i;
-    const c = 1 + 4 * s;
+    const c = 1 + 4 * i;
     fe.setAttribute('order', '3');
-    fe.setAttribute('kernelMatrix', `0 ${-s} 0 ${-s} ${c} ${-s} 0 ${-s} 0`);
+    fe.setAttribute('kernelMatrix', `0 ${-i} 0 ${-i} ${c} ${-i} 0 ${-i} 0`);
     fe.setAttribute('preserveAlpha', 'true');
-    flt.appendChild(fe);
-    svg.appendChild(flt);
+    flt.appendChild(fe); svg.appendChild(flt);
   }
   document.body.prepend(svg);
 })();
 
-// ─── Start Camera ────────────────────────────────────────
-document.getElementById('start').onclick = async () => {
+// ─── Camera Start / Stop ─────────────────────────────────
+const startBtn = document.getElementById('start');
+
+startBtn.onclick = async () => {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
     video.srcObject = stream;
     track = stream.getVideoTracks()[0];
     noCam.style.display = 'none';
     statusBadge.textContent = '● LIVE';
     statusBadge.classList.add('live');
-    document.getElementById('start').textContent = '⏹ Stop Camera';
-    document.getElementById('start').onclick = stopCamera;
+    startBtn.textContent = '⏹ Stop Camera';
+    startBtn.onclick = stopCamera;
 
-    // Try hardware capabilities (for info only — we use CSS filters regardless)
     const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (!caps.brightness && !caps.contrast) {
+    if (!caps.brightness && !caps.contrast)
       document.getElementById('hw-notice').style.display = 'block';
-    }
-
-    // Init FaceDetector if available
-    if ('FaceDetector' in window) {
-      try {
-        faceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
-      } catch(_) { faceDetector = null; }
-    }
 
     applyVisuals();
-    startFaceDetect();
+    startDetectLoop();
   } catch(err) {
     alert('Camera error: ' + err.message);
   }
 };
 
 function stopCamera() {
-  if (video.srcObject) {
-    video.srcObject.getTracks().forEach(t => t.stop());
-    video.srcObject = null;
-  }
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  video.srcObject = null;
   track = null;
   noCam.style.display = 'flex';
   statusBadge.textContent = '● OFFLINE';
   statusBadge.classList.remove('live');
   faceBox.style.display = 'none';
-  stopFaceDetect();
-  document.getElementById('start').textContent = '▶ Start Camera';
-  document.getElementById('start').onclick = arguments.callee.caller; // re-wire below
-  // Just reload the onclick
-  rewireStart();
-}
-
-function rewireStart() {
-  document.getElementById('start').onclick = async () => {
-    location.reload(); // simplest UX — reload to restart
-  };
+  stopDetectLoop();
+  startBtn.textContent = '▶ Start Camera';
+  startBtn.onclick = () => location.reload();
 }
 
 // ─── Reset ───────────────────────────────────────────────
 document.getElementById('reset').onclick = () => {
-  Object.keys(DEFAULTS).forEach(key => {
-    sliders[key].el.value = DEFAULTS[key];
-  });
+  Object.keys(DEFAULTS).forEach(k => { sliders[k].el.value = DEFAULTS[k]; });
   panX = 0; panY = 0;
   updateLabels(DEFAULTS);
   applyVisuals();
 };
 
 // ─── Drag to Pan ─────────────────────────────────────────
-const container = document.getElementById('camera-container');
+const camEl = document.getElementById('camera-container');
 
-container.addEventListener('mousedown', e => {
+camEl.addEventListener('mousedown', e => {
   dragging = true;
   dragStartX = e.clientX - panX;
   dragStartY = e.clientY - panY;
   e.preventDefault();
 });
-
 window.addEventListener('mousemove', e => {
   if (!dragging) return;
   panX = e.clientX - dragStartX;
   panY = e.clientY - dragStartY;
   updateTransform();
 });
-
 window.addEventListener('mouseup', () => { dragging = false; });
 
-// Touch support
-container.addEventListener('touchstart', e => {
+camEl.addEventListener('touchstart', e => {
   if (e.touches.length !== 1) return;
   dragging = true;
   dragStartX = e.touches[0].clientX - panX;
   dragStartY = e.touches[0].clientY - panY;
 }, { passive: true });
-
 window.addEventListener('touchmove', e => {
   if (!dragging || e.touches.length !== 1) return;
   panX = e.touches[0].clientX - dragStartX;
   panY = e.touches[0].clientY - dragStartY;
   updateTransform();
 }, { passive: true });
-
 window.addEventListener('touchend', () => { dragging = false; });
 
 // ─── Auto-Center Toggle ──────────────────────────────────
@@ -572,91 +586,92 @@ document.getElementById('toggle').onclick = () => {
   const btn = document.getElementById('toggle');
   btn.textContent = `⊙ Auto-Center: ${autoCenter ? 'ON' : 'OFF'}`;
   btn.classList.toggle('on', autoCenter);
-  if (!autoCenter) faceBox.style.display = 'none';
+  if (!autoCenter) { faceBox.style.display = 'none'; }
 };
 
-// ─── Face Detection Loop ──────────────────────────────────
-function startFaceDetect() {
+// ─── Face Detection Loop (face-api.js TinyFaceDetector) ──
+function startDetectLoop() {
   if (detectLoop) return;
-  detectLoop = setInterval(runDetect, 200); // ~5fps for detection
+  detectLoop = setInterval(runDetect, 150); // ~7 fps
 }
 
-function stopFaceDetect() {
+function stopDetectLoop() {
   clearInterval(detectLoop);
   detectLoop = null;
 }
 
 async function runDetect() {
-  if (!autoCenter || !video.videoWidth) return;
+  if (!autoCenter || !video.videoWidth || faceDetecting) return;
 
-  if (faceDetector) {
-    // Real FaceDetector API
-    if (faceDetecting) return;
-    faceDetecting = true;
-    try {
-      const faces = await faceDetector.detect(video);
-      faceDetecting = false;
-      if (faces.length > 0) {
-        const face = faces[0].boundingBox;
-        showFaceBox(face);
-        centerOnFace(face);
-      } else {
-        faceBox.style.display = 'none';
-        easeToCenter();
-      }
-    } catch(_) {
-      faceDetecting = false;
+  if (!faceModelReady) {
+    // Model not ready yet — show status and wait
+    faceStatus.style.display = 'block';
+    return;
+  }
+
+  faceDetecting = true;
+  try {
+    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 });
+    const result = await faceapi.detectSingleFace(video, options);
+
+    if (result) {
+      const { x, y, width, height } = result.box;
+      drawFaceBox(x, y, width, height);
+      panToFace(x, y, width, height);
+    } else {
+      faceBox.style.display = 'none';
       easeToCenter();
     }
-  } else {
-    // Fallback: gentle ease to center (no real detection)
-    easeToCenter();
+  } catch(e) {
+    console.warn('detect error', e);
   }
+  faceDetecting = false;
 }
 
-// Show bounding box overlay (scaled to container)
-function showFaceBox(face) {
-  if (!video.videoWidth) return;
-  const container = document.getElementById('camera-container');
-  const scaleX = container.clientWidth / video.videoWidth;
-  const scaleY = container.clientHeight / video.videoHeight;
+function drawFaceBox(x, y, w, h) {
+  // result.box is in video pixel space — scale to container display size
+  const c = document.getElementById('camera-container');
+  const sx = c.clientWidth  / video.videoWidth;
+  const sy = c.clientHeight / video.videoHeight;
   faceBox.style.display = 'block';
-  faceBox.style.left   = (face.x * scaleX) + 'px';
-  faceBox.style.top    = (face.y * scaleY) + 'px';
-  faceBox.style.width  = (face.width * scaleX) + 'px';
-  faceBox.style.height = (face.height * scaleY) + 'px';
+  faceBox.style.left   = (x * sx) + 'px';
+  faceBox.style.top    = (y * sy) + 'px';
+  faceBox.style.width  = (w * sx) + 'px';
+  faceBox.style.height = (h * sy) + 'px';
 }
 
-// Pan toward face center
-function centerOnFace(face) {
-  const container = document.getElementById('camera-container');
+function panToFace(x, y, w, h) {
+  const c    = document.getElementById('camera-container');
   const zoom = +sliders.zoom.el.value;
-  const scaleX = container.clientWidth / video.videoWidth;
-  const scaleY = container.clientHeight / video.videoHeight;
+  const sx   = c.clientWidth  / video.videoWidth;
+  const sy   = c.clientHeight / video.videoHeight;
 
-  // Face center in container coordinates
-  const faceCenterX = (face.x + face.width / 2) * scaleX;
-  const faceCenterY = (face.y + face.height / 2) * scaleY;
+  // Face center in container display coordinates
+  const fcx = (x + w / 2) * sx;
+  const fcy = (y + h / 2) * sy;
 
-  // Offset from container center
-  const targetX = -(faceCenterX - container.clientWidth / 2) * zoom * 0.3;
-  const targetY = -(faceCenterY - container.clientHeight / 2) * zoom * 0.3;
+  // How far off from container center?
+  const dx = fcx - c.clientWidth  / 2;
+  const dy = fcy - c.clientHeight / 2;
 
-  // Smooth lerp
-  panX += (targetX - panX) * 0.15;
-  panY += (targetY - panY) * 0.15;
+  // Target pan: move camera so face is centered
+  const targetX = -dx * zoom;
+  const targetY = -dy * zoom;
+
+  // Smooth lerp (strength 0.08 = gentle, 0.2 = snappy)
+  panX += (targetX - panX) * 0.08;
+  panY += (targetY - panY) * 0.08;
   updateTransform(zoom);
 }
 
-// Ease pan back to center (fallback)
 function easeToCenter() {
   if (Math.abs(panX) < 0.5 && Math.abs(panY) < 0.5) return;
-  panX *= 0.93;
-  panY *= 0.93;
+  panX *= 0.95;
+  panY *= 0.95;
   updateTransform();
 }
 
-// ─── Init labels ────────────────────────────────────────
+// ─── Init ────────────────────────────────────────────────
 updateLabels(DEFAULTS);
 </script>
 </body>
